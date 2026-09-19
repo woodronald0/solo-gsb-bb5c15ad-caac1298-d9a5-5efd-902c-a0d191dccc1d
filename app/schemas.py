@@ -53,6 +53,19 @@ class UpdateDocument(StrictModel):
         return v
 
 
+class RevertDocument(StrictModel):
+    revision: int = Field(
+        ..., ge=1, description="待撤销的目标修订号；必须存在且大于 1"
+    )
+    request_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="调用方生成的去重 ID（如 UUID），同 ID+同目标修订幂等",
+    )
+    author: Optional[str] = Field(default=None, max_length=200)
+
+
 class SetContract(StrictModel):
     # JSON Schema 根必须是对象或布尔（true/false 布尔 Schema）；
     # 进一步的合法性（关键字、$ref 等）由 validation.check_schema 做元校验。

@@ -1,7 +1,13 @@
 """三方合并 / Merge Patch 算法单元测试。"""
 from __future__ import annotations
 
-from app.merge import MISSING, apply_merge_patch, present_conflict, three_way_merge
+from app.merge import (
+    MISSING,
+    apply_merge_patch,
+    present_conflict,
+    reverse_merge_patch,
+    three_way_merge,
+)
 
 
 # ---------------- RFC 7386 apply_merge_patch ----------------
@@ -231,3 +237,87 @@ def test_noop_theirs_matching_current_generates_no_change():
     theirs = {"a": 9}   # 来稿基于旧基线的操作结果恰好等于当前版
     merged, conflicts = _merge(base, current, theirs)
     assert merged == {"a": 9} and conflicts == []
+
+
+# ---------------- reverse_merge_patch（撤销补丁） ----------------
+
+
+def _roundtrip(before, after):
+    """生成逆向补丁并应用到 after，必须还原为 before。"""
+    patch = reverse_merge_patch(before, after)
+    assert apply_merge_patch(after, patch) == before
+    return patch
+
+
+def test_reverse_scalar_change():
+    patch = _roundtrip({"a": 1, "b": 2}, {"a": 9, "b": 2})
+    # 最小化：未变化的 b 不出现在补丁中
+    assert patch == {"a": 1}
+
+
+def test_reverse_added_key_is_deleted():
+    patch = _roundtrip({"a": 1}, {"a": 1, "b": 2})
+    assert patch == {"b": None}
+
+
+def test_reverse_deleted_key_is_restored():
+    patch = _roundtrip({"a": 1, "b": 2}, {"a": 1})
+    assert patch == {"b": 2}
+
+
+def test_reverse_real_null_value_distinguished_from_delete():
+    # after 把 a 改成真实 null → 撤销改回旧值
+    patch = _roundtrip({"a": 1}, {"a": None})
+    assert patch == {"a": 1}
+    # after 新增 a:null → 撤销应删除该键，而不是保留 null
+    patch = _roundtrip({}, {"a": None})
+    assert patch == {"a": None}
+    assert apply_merge_patch({"a": None}, patch) == {}
+
+
+def test_reverse_nested_changes_are_minimal():
+    before = {"db": {"host": "h", "port": 5432}, "keep": 1}
+    after = {"db": {"host": "h", "port": 6543}, "keep": 1}
+    patch = _roundtrip(before, after)
+    assert patch == {"db": {"port": 5432}}
+
+
+def test_reverse_nested_add_and_delete():
+    before = {"db": {"host": "h"}, "gone": 7}
+    after = {"db": {"host": "h", "ssl": True}}
+    patch = _roundtrip(before, after)
+    assert patch == {"db": {"ssl": None}, "gone": 7}
+
+
+def test_reverse_array_replaced_whole():
+    before = {"items": [1, 2, 3]}
+    after = {"items": [1, 2, 3, 4]}
+    patch = _roundtrip(before, after)
+    # 数组整体还原，不按下标回退
+    assert patch == {"items": [1, 2, 3]}
+
+
+def test_reverse_type_change_replaces_whole_value():
+    before = {"a": {"x": 1}}
+    after = {"a": 5}
+    patch = _roundtrip(before, after)
+    assert patch == {"a": {"x": 1}}
+
+
+def test_reverse_non_object_root_replaces_entire_document():
+    assert _roundtrip([1, 2], [9]) == [1, 2]
+    assert _roundtrip({"a": 1}, None) == {"a": 1}
+    assert _roundtrip(None, {"a": 1}) is None
+    assert _roundtrip("old", "new") == "old"
+
+
+def test_reverse_identical_documents_is_empty_patch():
+    assert reverse_merge_patch({"a": 1, "b": [1]}, {"a": 1, "b": [1]}) == {}
+
+
+def test_reverse_patch_does_not_mutate_inputs():
+    before = {"a": {"x": 1}}
+    after = {"a": {"x": 2}}
+    reverse_merge_patch(before, after)
+    assert before == {"a": {"x": 1}}
+    assert after == {"a": {"x": 2}}

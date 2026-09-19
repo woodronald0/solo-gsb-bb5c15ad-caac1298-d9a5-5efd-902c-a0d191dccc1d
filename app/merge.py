@@ -112,6 +112,50 @@ def three_way_merge(
     return merged, conflicts
 
 
+def reverse_merge_patch(before: Any, after: Any) -> Any:
+    """构造把 *after* **还原**为 *before* 的 RFC 7386 JSON Merge Patch（撤销补丁）。
+
+    用于撤销接口：取目标修订的前快照 *before* 与目标快照 *after*，
+    生成的补丁满足 ``apply_merge_patch(after, reverse_merge_patch(before, after)) == before``。
+
+    构造规则（与打补丁对称）：
+
+    * 两边都是对象 → 逐键递归，只保留真正变化的键（最小化补丁）：
+      - 键仅存在于 *after*（修订新增）→ 补丁中置 ``null``（撤销即删除）；
+      - 键仅存在于 *before*（修订删除）→ 补丁中还原为 *before* 的值；
+      - 两边都有但值不同 → 递归构造子补丁；
+      - 值相同 → 不出现在补丁中；
+    * 其余情况（标量 / 数组 / 类型变化 / 根级非对象）→ 补丁整体取 *before*
+      （数组等复合标量在 Merge Patch 中只能整体替换，不按下标回退）。
+
+    纯函数，不修改入参。
+    """
+    if isinstance(before, dict) and isinstance(after, dict):
+        patch: dict[str, Any] = {}
+        for key in set(before) | set(after):
+            if key not in before:
+                # after 新增的键：用 null 删除
+                patch[key] = None
+            elif key not in after:
+                # after 删除的键：原样还原（after 中该键缺失，整体赋值即可）
+                patch[key] = before[key]
+            else:
+                old_value, new_value = before[key], after[key]
+                if old_value == new_value:
+                    # 值未变：不进补丁
+                    continue
+                if isinstance(old_value, dict) and isinstance(new_value, dict):
+                    sub = reverse_merge_patch(old_value, new_value)
+                    if sub:
+                        patch[key] = sub
+                else:
+                    # 标量 / 数组 / 类型变化：整体还原为旧值
+                    patch[key] = old_value
+        return patch
+    # 至少一侧不是对象：Merge Patch 整体替换为前快照
+    return before
+
+
 def present_conflict(conflict: dict[str, Any]) -> dict[str, Any]:
     """把冲突记录转换成对外响应（MISSING → null + missing 标注）。"""
     missing = [
