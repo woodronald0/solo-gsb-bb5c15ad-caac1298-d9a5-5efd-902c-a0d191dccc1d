@@ -1,7 +1,13 @@
 """三方合并 / Merge Patch 算法单元测试。"""
 from __future__ import annotations
 
-from app.merge import MISSING, apply_merge_patch, present_conflict, three_way_merge
+from app.merge import (
+    MISSING,
+    apply_merge_patch,
+    merge_patch_diff,
+    present_conflict,
+    three_way_merge,
+)
 
 
 # ---------------- RFC 7386 apply_merge_patch ----------------
@@ -231,3 +237,70 @@ def test_noop_theirs_matching_current_generates_no_change():
     theirs = {"a": 9}   # 来稿基于旧基线的操作结果恰好等于当前版
     merged, conflicts = _merge(base, current, theirs)
     assert merged == {"a": 9} and conflicts == []
+
+
+# ---------------- merge_patch_diff（撤销用的逆向补丁） ----------------
+
+
+def test_diff_is_reverse_of_apply():
+    old = {"a": 1, "b": 2, "c": {"x": 1, "y": 2}}
+    new = {"a": 9, "c": {"x": 1, "z": 3}, "d": 4}
+    patch = merge_patch_diff(old, new)
+    assert patch == {"a": 9, "b": None, "c": {"y": None, "z": 3}, "d": 4}
+    # 核心不变式：补丁应用回 old 必须精确得到 new
+    assert apply_merge_patch(old, patch) == new
+
+
+def test_diff_equal_documents_is_empty_patch():
+    doc = {"a": [1, 2], "b": {"c": None}}
+    assert merge_patch_diff(doc, doc) == {}
+    assert apply_merge_patch(doc, {}) == doc
+
+
+def test_diff_key_added_has_value_deleted_is_null():
+    assert merge_patch_diff({"a": 1}, {"a": 1, "b": 2}) == {"b": 2}
+    assert merge_patch_diff({"a": 1, "b": 2}, {"a": 1}) == {"b": None}
+
+
+def test_diff_real_null_vs_delete_is_distinguished():
+    # old 中 a 被删除 vs new 中 a 存为真实 null：补丁给出 null 值而非删除标记
+    patch = merge_patch_diff({"a": 1}, {"a": None})
+    assert patch == {"a": None}
+    # 注意：RFC 7386 无法区分“删除”与“置为 null”，这是协议固有限制；
+    # 撤销场景里该路径会经由三方合并按标量整体比较处理。
+    assert apply_merge_patch({"a": 1}, patch) == {}
+
+
+def test_diff_array_replaces_whole_value():
+    assert merge_patch_diff({"items": [1, 2, 3]}, {"items": [1, 2]}) == {
+        "items": [1, 2]
+    }
+
+
+def test_diff_scalar_root_replaces_whole_document():
+    assert merge_patch_diff([1, 2], [1, 2, 3]) == [1, 2, 3]
+    assert merge_patch_diff({"a": 1}, None) is None
+    assert merge_patch_diff(None, {"a": 1}) == {"a": 1}
+
+
+def test_diff_type_change_emits_full_new_value():
+    # 对象变成标量：整体替换
+    assert merge_patch_diff({"a": {"b": 1}}, {"a": 5}) == {"a": 5}
+    # 标量变成对象：新对象整体给出
+    assert merge_patch_diff({"a": 5}, {"a": {"b": 1}}) == {"a": {"b": 1}}
+
+
+def test_diff_nested_object_recurses():
+    old = {"db": {"host": "h", "port": 5432}, "keep": [1]}
+    new = {"db": {"host": "h2", "port": 5432, "ssl": True}, "keep": [1]}
+    patch = merge_patch_diff(old, new)
+    assert patch == {"db": {"host": "h2", "ssl": True}}
+    assert apply_merge_patch(old, patch) == new
+
+
+def test_diff_does_not_mutate_inputs():
+    old = {"a": {"b": 1}}
+    new = {"a": {"b": 2, "c": 3}}
+    merge_patch_diff(old, new)
+    assert old == {"a": {"b": 1}}
+    assert new == {"a": {"b": 2, "c": 3}}

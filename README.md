@@ -10,6 +10,20 @@
 - 同一 `request_id` + 相同内容 → **幂等**，直接返回原结果；
 - 同一 `request_id` + 不同内容（patch 或 base_revision 变化）→ **409**。
 
+需要回滚某次历史修改时，可用 **`POST /documents/{id}/reverts` 按修订号撤销**：
+请求携带待撤销的 `revision`、`request_id` 与可选 `author`。服务端以目标修订的
+**前后快照**构造逆向 Merge Patch，再以目标修订为基线、当前内容为服务端版做三方合并：
+
+- 目标修订必须**存在且大于 1**（修订 1 是创建快照，无可撤销的前态）
+  → 否则 `422 invalid_revert_revision`；
+- 目标修订**之后**发生在其他路径的修改自动保留；
+- 目标涉及的路径后来被改成**不同值** → `409 revert_conflict`，
+  返回 JSON Pointer 与 base/current/theirs 三方值，事务回滚、**不写新修订**；
+- 撤销成功生成一条**普通可追溯修订**（逆向补丁存入 `patch`、目标修订号存入
+  `base_revision`），最终候选仍须通过文档当前的 JSON Schema 契约；
+- `request_id` 与 PATCH 共用幂等表：相同请求（`revision`/`author` 指纹一致）
+  重放原结果，同 ID 不同内容（或与 PATCH 混用）→ `409 request_id_conflict`。
+
 需要一次发布多个互不相关的文档时，可用 **`POST /releases` 原子发布**：
 请求携带 `release_id` 与 2～20 项文档更新（`document_id`、`base_revision`、
 `patch`、`author`，且 `document_id` 互不重复），服务端在**同一个 SQLite 写事务**内
@@ -79,6 +93,7 @@ docker compose down -v       # 停止并删除数据卷
 | `GET` | `/documents` | 列出文档 |
 | `GET` | `/documents/{id}` | 读取当前版本（含 `revision`） |
 | `PATCH` | `/documents/{id}` | 提交 Merge Patch（三方合并，存在契约时最终校验） |
+| `POST` | `/documents/{id}/reverts` | 按修订号撤销（逆向补丁 + 三方合并，生成普通可追溯修订） |
 | `POST` | `/releases` | 原子发布 2～20 个文档更新（单事务、聚合失败、整批幂等） |
 | `GET` | `/documents/{id}/revisions` | 修订历史（支持 `limit`/`offset`/`order=asc|desc`） |
 | `GET` | `/documents/{id}/revisions/{rev}` | 查询指定修订的内容与 patch |
@@ -189,6 +204,86 @@ HTTP/1.1 409 Conflict
 
 同 `request_id` 但 `base_revision` 或 `patch` 不同 → `409 request_id_conflict`。
 指纹为 `sha256(base_revision + 规范化JSON(patch))`，幂等记录按 `(document_id, request_id)` 持久化。
+
+### 撤销修订（POST /documents/{id}/reverts）
+
+撤销不是“把文档指针拨回旧版”，而是一次**带三方合并的普通更新**：
+服务端取出目标修订 `revision` 的后快照（该修订的内容）与前快照（`revision - 1` 的内容），
+按 RFC 7386 构造**逆向 Merge Patch**，再以「目标修订 / 当前版 / 前态」做递归三方比较。
+因此目标修订之后其他人在**不相干路径**上的修改会被保留，只有同一路径后来又被
+改成不同值时才报冲突。
+
+```bash
+# 历史：rev1 {"a":1,"b":2} → rev2 a=100 → rev3 c.y=2
+curl -X POST http://localhost:8000/documents/demo/reverts \
+  -H 'Content-Type: application/json' \
+  -d '{"revision": 2, "request_id": "undo-001", "author": "alice"}'
+```
+
+```json
+{
+  "id": "demo",
+  "revision": 4,
+  "reverted_revision": 2,
+  "request_id": "undo-001",
+  "replayed": true,
+  "changed": true,
+  "idempotent": false,
+  "content": {"a": 1, "b": 2, "c": {"x": 1, "y": 2}}
+}
+```
+
+- `reverted_revision` 为请求中指定的目标修订号；撤销本身是**新的普通修订**：
+  修订历史中该条的 `patch` 为逆向补丁、`base_revision` 为目标修订号、
+  `request_id` 为本次撤销的去重 ID、`author` 为请求所给作者；
+- 目标修订就是当前版时走快路径（`replayed: false`）；其后还有修订时走三方重放
+  （`replayed: true`）；重放结果与当前版完全相同则 `changed: false`、不产生新修订；
+- 目标修订不存在或 `revision <= 1` → `422 invalid_revert_revision`
+  （响应含 `revision` 与 `current_revision`）；
+- 撤销成功的候选内容仍须通过文档**当前**的 JSON Schema 契约（若有），
+  失败为 `422 schema_validation_failed`，不写修订、不占用 `request_id`。
+
+#### 撤销冲突：409 revert_conflict
+
+目标修订涉及的路径在此后被改成了不同值时，冲突响应与 PATCH 同构，
+`error` 为 `revert_conflict`，并额外给出 `revert_revision`：
+
+```json
+HTTP/1.1 409 Conflict
+{
+  "detail": {
+    "error": "revert_conflict",
+    "document_id": "demo",
+    "request_id": "undo-001",
+    "revert_revision": 2,
+    "base_revision": 2,
+    "current_revision": 3,
+    "conflicts": [
+      {
+        "path": "/a",
+        "values": {"base": 100, "current": 300, "theirs": 1},
+        "missing": []
+      }
+    ]
+  }
+}
+```
+
+三方值的含义：`base` 是目标修订（后快照）在该路径的值，`current` 是当前值，
+`theirs` 是撤销想要恢复的前态值；删除语义同样用 `missing` 标注。
+冲突在事务内回滚：**不写新修订、不占用 `request_id`**，
+调用方解决分歧（或改用更新的修订号）后可用同一 ID 重试。
+
+#### 撤销的幂等
+
+撤销请求与 PATCH **共用** `(document_id, request_id)` 幂等表，
+指纹为 `sha256("revert" + 规范化JSON([revision, author]))`：
+
+- 相同请求重放（任意次、哪怕文档又前进了）→ 返回首次撤销的原始结果，
+  `"idempotent": true`，不重新合并、不产生新修订；
+- 同一 `request_id` 对应不同的 `revision` 或 `author` → `409 request_id_conflict`；
+- 同一 `request_id` 先用于 PATCH、再用于撤销（或反过来）同样 → `409`；
+- 只有**成功**的撤销才持久化幂等记录（冲突 / 契约失败不占用 ID）。
 
 ### 原子发布（POST /releases）
 
@@ -411,11 +506,13 @@ HTTP/1.1 422 Unprocessable Entity
 | `404 not_found` | 文档不存在（契约接口同理） |
 | `404 schema_not_found` | 文档存在但未设置契约（GET） |
 | `409 conflict` | 三方合并存在分歧路径（原子发布单项失败时聚合在 `failures` 中） |
-| `409 request_id_conflict` | 同一 request_id 对应了不同内容 |
+| `409 revert_conflict` | 撤销目标修订涉及的路径后来被改成不同值（不写新修订、不占用 request_id） |
+| `409 request_id_conflict` | 同一 request_id 对应了不同内容（PATCH 与撤销共用幂等表） |
 | `409 release_id_conflict` | 同一 release_id 对应了不同的整批请求 |
 | `409 document_exists` | 创建时 ID 已存在 |
 | `422 release_failed` | 原子发布存在失败项（`failures` 按输入顺序汇总，整批回滚、不占用 release_id） |
 | `422 unknown_base_revision` | base_revision 不是该文档的现存修订 |
+| `422 invalid_revert_revision` | 待撤销 revision 不存在或不大于 1（修订 1 为创建快照） |
 | `422 invalid_schema` | 设置契约时 Schema 本身不符合 JSON Schema 2020-12 |
 | `422 schema_validation_failed` | 当前文档（设置时）或合并后的最终候选（PATCH 时）不满足契约 |
 
@@ -431,9 +528,10 @@ HTTP/1.1 422 Unprocessable Entity
 │   ├── schemas.py     # Pydantic 请求模型（额外字段拒绝）
 │   └── config.py      # 环境变量配置
 ├── tests/
-│   ├── test_merge.py     # 合并算法单元测试（25 例）
+│   ├── test_merge.py     # 合并算法单元测试（含逆向补丁差分，34 例）
 │   ├── test_api.py       # API 集成测试（23 例，独立临时数据库）
 │   ├── test_contracts.py # 契约接口与 PATCH 校验集成测试（19 例）
+│   ├── test_reverts.py   # POST /documents/{id}/reverts 撤销集成测试（25 例）
 │   └── test_releases.py  # POST /releases 原子发布集成测试（17 例）
 ├── Dockerfile
 ├── docker-compose.yml

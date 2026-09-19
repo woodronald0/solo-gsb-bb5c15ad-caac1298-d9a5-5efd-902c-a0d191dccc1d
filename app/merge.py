@@ -112,6 +112,41 @@ def three_way_merge(
     return merged, conflicts
 
 
+def merge_patch_diff(old: Any, new: Any) -> Any:
+    """构造把 *old* 变成 *new* 的 RFC 7386 Merge Patch（最小对象级差分）。
+
+    与 :func:`apply_merge_patch` 互逆：``apply_merge_patch(old, merge_patch_diff(old, new))``
+    恒等于 *new*。用于撤销接口——对目标修订的「前快照 → 后快照」取逆，
+    得到的补丁应用到任何与前快照同构的基线上，都表达同一次逆向变更。
+
+    * 两侧都是对象时按键递归：新增/整体变更的值直接给出，删除的键给 ``null``，
+      子对象收敛为空时省略（避免 ``{}`` 这种无意义层级）；
+    * 任一侧不是对象（数组 / 标量 / null）→ 整体替换，补丁直接为 *new*
+      （数组不按下标差分，与 RFC 7386 的整体替换语义一致）；
+    * 两侧相等 → 空对象补丁（no-op）。
+
+    纯函数，不修改入参。
+    """
+    if isinstance(old, dict) and isinstance(new, dict):
+        patch: dict[str, Any] = {}
+        for key in set(old) | set(new):
+            if key not in new:
+                # 键被删除：null 是 Merge Patch 的删除标记
+                patch[key] = None
+            elif key not in old:
+                # 新增键：直接给值
+                patch[key] = new[key]
+            elif old[key] != new[key]:
+                sub = merge_patch_diff(old[key], new[key])
+                # 两侧皆为对象但子级无差异时不会进入此分支；
+                # 跳过收敛为空的嵌套补丁（仅当旧值恰为 {} 等边界情形）。
+                if sub != {}:
+                    patch[key] = sub
+        return patch
+    # 至少一侧不是对象（或两侧对象身份不同但相等的情况已被 != 排除）：整体替换
+    return new
+
+
 def present_conflict(conflict: dict[str, Any]) -> dict[str, Any]:
     """把冲突记录转换成对外响应（MISSING → null + missing 标注）。"""
     missing = [

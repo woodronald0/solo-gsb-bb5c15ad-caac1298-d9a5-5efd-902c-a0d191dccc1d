@@ -12,8 +12,19 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .config import settings
-from .merge import apply_merge_patch, present_conflict, three_way_merge
-from .schemas import CreateDocument, CreateRelease, SetContract, UpdateDocument
+from .merge import (
+    apply_merge_patch,
+    merge_patch_diff,
+    present_conflict,
+    three_way_merge,
+)
+from .schemas import (
+    CreateDocument,
+    CreateRelease,
+    RevertDocument,
+    SetContract,
+    UpdateDocument,
+)
 from .validation import check_schema, validate_instance
 
 
@@ -26,9 +37,9 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="共享 JSON 配置三方合并 API",
-    version="1.1.0",
+    version="1.2.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
-    "基线过期时递归三方合并，路径冲突返回 409。",
+    "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销。",
     lifespan=lifespan,
 )
 
@@ -68,22 +79,27 @@ class _ItemError(Exception):
         super().__init__(code)
 
 
-def prepare_document_update(
+def _prepare_candidate(
     conn: sqlite3.Connection,
     doc_id: str,
     base_revision: int,
     patch: Any,
     request_id: str,
+    *,
+    conflict_error: str = "conflict",
+    conflict_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """写事务内执行单项更新的**只读合并与校验**，返回落库所需的候选结果。
+    """写事务内执行「基线 → Merge Patch → 三方合并 → 契约校验」的只读流程。
 
-    顺序与单文档 PATCH 完全一致：
+    返回落库所需的候选结果，不写入任何数据，也不登记幂等记录；
+    调用方负责插入修订 / 回滚。*conflict_error* / *conflict_extra* 允许撤销
+    接口把同一种三方分歧渲染成自己的 ``revert_conflict`` 错误体。
+
+    顺序：
     ① 基线必须存在（``unknown_base_revision``）；
     ② Merge Patch 应用到基线得到 theirs；基线过期时递归三方合并
-      （路径分歧 → ``conflict``）；
+      （路径分歧 → *conflict_error*）；
     ③ 文档存在契约时校验最终候选（``schema_validation_failed``）。
-
-    本函数不写入任何数据，也不登记幂等记录；调用方负责插入修订 / 回滚。
     """
     doc = db.get_document(conn, doc_id)
     if doc is None:
@@ -117,15 +133,16 @@ def prepare_document_update(
         merged, raw_conflicts = three_way_merge(base_content, current_content, theirs)
         replayed = True
         if raw_conflicts:
-            raise _ItemError(
-                "conflict",
-                status.HTTP_409_CONFLICT,
-                document_id=doc_id,
-                request_id=request_id,
-                base_revision=base_revision,
-                current_revision=current_revision,
-                conflicts=[present_conflict(c) for c in raw_conflicts],
-            )
+            detail: dict[str, Any] = {
+                "document_id": doc_id,
+                "request_id": request_id,
+                "base_revision": base_revision,
+                "current_revision": current_revision,
+                "conflicts": [present_conflict(c) for c in raw_conflicts],
+            }
+            if conflict_extra:
+                detail = {**conflict_extra, **detail}
+            raise _ItemError(conflict_error, status.HTTP_409_CONFLICT, **detail)
 
     # 第二步（Merge Patch 与三方重放均完成后）：若文档存在契约，
     # 校验最终候选内容。失败由调用方回滚——不写修订、不占用幂等 ID。
@@ -153,6 +170,93 @@ def prepare_document_update(
         "current_revision": current_revision,
         "updated_at": db.utcnow() if changed else doc["updated_at"],
     }
+
+
+def prepare_document_update(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    base_revision: int,
+    patch: Any,
+    request_id: str,
+) -> dict[str, Any]:
+    """单文档 PATCH 的只读合并与校验；原子发布同样复用本入口。
+
+    与 :func:`_prepare_candidate` 的顺序完全一致，路径分歧渲染为 ``conflict``。
+    """
+    return _prepare_candidate(
+        conn, doc_id, base_revision, patch, request_id
+    )
+
+
+def prepare_revert(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    target_revision: int,
+    request_id: str,
+) -> dict[str, Any]:
+    """写事务内为撤销请求做只读准备，返回落库所需的候选结果。
+
+    顺序：
+    ① 文档必须存在（``not_found``，由路由在事务外先判一次）；
+    ② 目标修订必须存在且 **大于 1**（修订 1 是创建快照，无可撤销的前态）
+      → 否则 ``invalid_revert_revision`` 422；
+    ③ 以目标修订的「前快照 revision-1 → 后快照 revision」构造逆向 Merge Patch；
+    ④ 三方合并以**目标修订（后快照）为基线**、逆向补丁应用其上得到的前态为
+      theirs、当前内容为 current——目标修订之后其他路径上的修改自动保留；
+      目标涉及的路径后来被改成不同值 → ``revert_conflict`` 409
+      （冲突体含 JSON Pointer 与三方值）；
+    ⑤ 文档存在契约时，撤销后的最终候选仍须通过当前契约
+      （``schema_validation_failed`` 422）。
+
+    本函数不写入任何数据；冲突 / 校验失败由调用方回滚。
+    """
+    doc = db.get_document(conn, doc_id)
+    if doc is None:
+        raise _ItemError("not_found", status.HTTP_404_NOT_FOUND, document_id=doc_id)
+
+    current_revision = doc["current_revision"]
+    if target_revision <= 1 or target_revision > current_revision:
+        raise _ItemError(
+            "invalid_revert_revision",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            document_id=doc_id,
+            revision=target_revision,
+            current_revision=current_revision,
+            reason="待撤销修订必须存在且大于 1（修订 1 为创建快照，无可撤销的前态）",
+        )
+
+    # 目标修订的行在上界检查后必然存在（修订号连续、不可删除）；
+    # 前快照 revision-1 >= 1 同样必然存在。
+    target_row = db.get_revision(conn, doc_id, target_revision)
+    if target_row is None:  # 防御性分支：理论不可达
+        raise _ItemError(
+            "invalid_revert_revision",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            document_id=doc_id,
+            revision=target_revision,
+            current_revision=current_revision,
+            reason="目标修订不存在",
+        )
+    before = json.loads(
+        db.get_revision(conn, doc_id, target_revision - 1)["content"]
+    )
+    after = json.loads(target_row["content"])
+    reverse_patch = merge_patch_diff(after, before)
+
+    # 撤销方“站在目标修订上”：基线为后快照，逆向补丁应用到基线即得到前态。
+    result = _prepare_candidate(
+        conn,
+        doc_id,
+        target_revision,
+        reverse_patch,
+        request_id,
+        conflict_error="revert_conflict",
+        conflict_extra={"revert_revision": target_revision},
+    )
+    # 逆向补丁随候选结果带出，供路由落库到修订的 patch 列，避免重复构造。
+    result["reverse_patch"] = reverse_patch
+    result["reverted_revision"] = target_revision
+    return result
 
 
 # ---------------------------------------------------------------- 健康检查
@@ -490,6 +594,142 @@ def update_document(
             "id": doc_id,
             "revision": new_revision,
             "base_revision": body.base_revision,
+            "request_id": body.request_id,
+            "replayed": replayed,
+            "changed": changed,
+            "idempotent": False,
+            "content": merged,
+            "created_at": now if changed else result["updated_at"],
+        }
+    )
+
+
+# ---------------------------------------------------------------- 撤销（逆向三方合并）
+
+
+@app.post("/documents/{doc_id}/reverts", tags=["documents"])
+def revert_document(
+    doc_id: str,
+    body: RevertDocument,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> JSONResponse:
+    """撤销指定修订：以其前后快照构造逆向变更，再与当前内容三方合并。
+
+    * 目标修订必须存在且大于 1 → 否则 ``422 invalid_revert_revision``；
+    * 目标修订之后发生在**其他路径**的修改自动保留；
+    * 目标涉及的路径后来被改成不同值 → ``409 revert_conflict``，
+      冲突体含 JSON Pointer 与 base/current/theirs 三方值，事务回滚不写新修订；
+    * 撤销成功生成一条**普通修订**（可在历史中追溯被撤销的修订号与 request_id），
+      最终候选仍须通过文档当前的 JSON Schema 契约；
+    * ``request_id`` 幂等：相同请求（revision/author 规范化指纹相同）重放原结果，
+      同 ID 不同内容 → ``409 request_id_conflict``。
+    """
+    if db.get_document(conn, doc_id) is None:
+        raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+
+    # 幂等指纹：revert 前缀与 PATCH 的 (base_revision, patch) 指纹区分命名空间，
+    # 内容包含 revision 与 author，任一变化都视为不同请求。
+    fingerprint = hashlib.sha256(
+        b"revert\n"
+        + db.canonical([body.revision, body.author]).encode("utf-8")
+    ).hexdigest()
+
+    existing = db.get_request(conn, doc_id, body.request_id)
+    if existing is not None:
+        if existing["fingerprint"] != fingerprint:
+            raise err(
+                status.HTTP_409_CONFLICT,
+                "request_id_conflict",
+                document_id=doc_id,
+                request_id=body.request_id,
+                reason="同一 request_id 已用于 revision/author 不同（或非撤销）的请求",
+            )
+        rev_row = db.get_revision(conn, doc_id, existing["revision"])
+        return JSONResponse(
+            {
+                "id": doc_id,
+                "revision": existing["revision"],
+                "reverted_revision": body.revision,
+                "request_id": body.request_id,
+                "replayed": None,
+                "changed": bool(existing["changed"]),
+                "idempotent": True,
+                "content": json.loads(rev_row["content"]),
+                "created_at": rev_row["created_at"],
+            }
+        )
+
+    # 写事务内重读，消除“检查后写入”的并发窗口（BEGIN IMMEDIATE 取写锁）
+    with db.transaction(conn):
+        doc = db.get_document(conn, doc_id)
+        if doc is None:
+            raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+        existing = db.get_request(conn, doc_id, body.request_id)
+        if existing is not None:
+            if existing["fingerprint"] != fingerprint:
+                raise err(
+                    status.HTTP_409_CONFLICT,
+                    "request_id_conflict",
+                    document_id=doc_id,
+                    request_id=body.request_id,
+                    reason="同一 request_id 已用于 revision/author 不同（或非撤销）的请求",
+                )
+            current_row = db.get_revision(conn, doc_id, existing["revision"])
+            return JSONResponse(
+                {
+                    "id": doc_id,
+                    "revision": existing["revision"],
+                    "reverted_revision": body.revision,
+                    "request_id": body.request_id,
+                    "replayed": None,
+                    "changed": bool(existing["changed"]),
+                    "idempotent": True,
+                    "content": json.loads(current_row["content"]),
+                    "created_at": current_row["created_at"],
+                }
+            )
+
+        try:
+            result = prepare_revert(conn, doc_id, body.revision, body.request_id)
+        except _ItemError as exc:
+            raise err(exc.status_code, exc.code, **exc.extra)
+
+        merged = result["merged"]
+        replayed = result["replayed"]
+        changed = result["changed"]
+        current_revision = result["current_revision"]
+        # 落库修订的 base_revision 记录为被撤销的目标修订；
+        # patch 列为逆向 Merge Patch，历史可完整追溯。
+        reverse_patch = result["reverse_patch"]
+        now = db.utcnow()
+        if changed:
+            new_revision = current_revision + 1
+            db.insert_revision(
+                conn,
+                doc_id,
+                new_revision,
+                merged,
+                reverse_patch,
+                body.revision,
+                body.request_id,
+                replayed,
+                body.author,
+                now,
+            )
+        else:
+            # 逆向三方合并后结果与当前版相同（撤销目标的影响早已不存在）：
+            # 与 PATCH 一致，不生成新修订。
+            new_revision = current_revision
+
+        db.insert_request(
+            conn, doc_id, body.request_id, fingerprint, new_revision, changed
+        )
+
+    return JSONResponse(
+        {
+            "id": doc_id,
+            "revision": new_revision,
+            "reverted_revision": body.revision,
             "request_id": body.request_id,
             "replayed": replayed,
             "changed": changed,
